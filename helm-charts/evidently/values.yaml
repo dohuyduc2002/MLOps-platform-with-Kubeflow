@@ -1,0 +1,23 @@
+image:
+  repository: evidently/evidently-service
+  tag: 0.7.7
+  pullPolicy: IfNotPresent
+
+minio:
+  endpoint: http://minio.minio.svc.cluster.local:9000
+  accessKey: minio
+  secretKey: minio123
+
+service:
+  type: ClusterIP      
+  port: 8000
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  className: nginx    
+  host: evidently.yourdomain.com
+  path: /
+
+  
+workspace: s3://evidently/snapshots

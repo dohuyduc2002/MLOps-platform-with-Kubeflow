@@ -1,34 +1,41 @@
 from contextlib import asynccontextmanager
 from functools import wraps
 from io import BytesIO
-import asyncio
 from time import time
 from typing import List, Dict, Any
-
 import numpy as np
 import pandas as pd
+import json, datetime as dt
+
 from fastapi import FastAPI, Body, Depends
+from evidently.ui.workspace import Workspace
+
 from opentelemetry import metrics
 from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from opentelemetry.sdk.metrics import MeterProvider
 from prometheus_client import start_http_server
 
 from client.api.schema import RawItem
-from client.api.utils import ApiConfig, Predictor
+from client.api.utils import (
+    map_evidently_data,
+    custom_evidently_report,
+    ApiConfig,
+    Predictor,
+)
 
 
-def entropy(p: np.ndarray) -> float:
+def entropy(p: np.ndarray):
     return float(np.sum(p * np.log2(p + 1e-10)))
 
 
-def confidence(p: np.ndarray) -> float:
+def confidence(p: np.ndarray):
     return float(p.max())
 
 
 class MetricsHandler:
-    def __init__(self) -> None:
-        self._avg_entropy = 0.0
-        self._avg_confidence = 0.0
+    def __init__(self) :
+        self.avg_entropy = 0.0
+        self.avg_confidence = 0.0
 
         reader = PrometheusMetricReader()
         metrics.set_meter_provider(MeterProvider(metric_readers=[reader]))
@@ -37,11 +44,11 @@ class MetricsHandler:
 
         meter.create_observable_gauge(
             "api_prediction_entropy",
-            callbacks=[lambda _opts: [metrics.Observation(self._avg_entropy)]],
+            callbacks=[lambda _opts: [metrics.Observation(self.avg_entropy)]],
         )
         meter.create_observable_gauge(
             "api_avg_confidence",
-            callbacks=[lambda _opts: [metrics.Observation(self._avg_confidence)]],
+            callbacks=[lambda _opts: [metrics.Observation(self.avg_confidence)]],
         )
 
     def update(self, ents: List[float], confs: List[float]) -> None:
@@ -94,13 +101,10 @@ class PredictionService:
         self.metrics = MetricsHandler()
 
     @classmethod
-    async def create(cls, cfg: ApiConfig):
-        def _init():
-            predictor = Predictor(cfg)
-            predictor.load_artifacts()
-            return cls(cfg, predictor)
-
-        return await asyncio.to_thread(_init)
+    def create(cls, cfg: ApiConfig):
+        predictor = Predictor(cfg)
+        predictor.load_artifacts()
+        return cls(cfg, predictor)
 
     # --------------------------------------------------------------
     # helper build response
@@ -126,8 +130,8 @@ class PredictionService:
                 for y, p, e, c in zip(preds, proba, entropies, confidences)
             ],
             "metrics": {
-                "avg_entropy": self.metrics._avg_entropy,
-                "avg_confidence": self.metrics._avg_confidence,
+                "avg_entropy": self.metrics.avg_entropy,
+                "avg_confidence": self.metrics.avg_confidence,
             },
         }
 
@@ -162,7 +166,7 @@ def create_app():
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.service = await PredictionService.create(cfg)
+        app.state.service = PredictionService.create(cfg)
         yield
 
     app = FastAPI(lifespan=lifespan)
@@ -184,6 +188,36 @@ def create_app():
     @app.post("/Prediction-by-id")
     def predict_by_id(id: int, service: PredictionService = Depends(get_service)):
         return service.predict_by_id(id)
+
+
+    @app.get("/data-monitor") #to do fix evidently workspace
+    def data_monitor(service: PredictionService = Depends(get_service)):
+        cfg = service.cfg
+
+        workspace_path = cfg.evidently_workspace  
+
+        evidently_ws = Workspace.create(workspace_path) 
+
+        project_name = "credit_underwriting"
+        project = None
+        existing = evidently_ws.search_project(project_name)
+        if existing:
+            project = existing[0]
+        else:
+            project = evidently_ws.create_project(project_name)
+            project.description = "Monitoring credit underwriting snapshots"
+            project.save()
+
+        reference_data, current_data = map_evidently_data(cfg)
+        snapshot = custom_evidently_report(reference_data, current_data)
+
+        evidently_ws.add_run(project.id, snapshot)
+
+        return {
+            "status": "stored",
+            "project_id": project.id,
+            "project_name": project_name
+        }
 
     return app
 
