@@ -1,0 +1,38 @@
+replicaCount: 1
+
+image:
+  repository: microwave1005/prediction-api
+  tag: latest 
+  pullPolicy: IfNotPresent
+
+service:
+  name: prediction-api
+  namespace: api
+  ports:
+    http: 8000
+    metrics: 8001
+
+env:
+  S3_ENDPOINT: "minio.minio.svc.cluster.local:9000"
+  MLFLOW_ENDPOINT: "http://mlflow.mlflow.svc.cluster.local:5000"
+  PARENT_RUN_ID: "62f72503b9d243bda7dafca69258d494"
+  TRANSFORMER_ARTIFACT_PATH: "prep/transformer.joblib"
+  EVIDENTLY_WORKSPACE: "http://35.202.139.205:8000/"
+  FSSPEC_S3_ENDPOINT_URL: "http://minio.minio.svc.cluster.local:9000"
+  JAEGER_AGENT_HOST: "jaeger-agent.monitoring.svc.cluster.local"
+
+secrets:
+  name: minio-creds
+  accessKeyIdKey: access_key
+  secretAccessKeyKey: secret_key
+
+monitoring:
+  enabled: true
+  releaseLabel: kps
+  interval: 15s
+
+ingress:
+  enabled: false
+  ingressClassName: nginx
+  annotations: {}
+  rules: []
