@@ -1,12 +1,12 @@
-from io import BytesIO
 from time import time
 from typing import List
 import os
-
+from functools import wraps
+from io import BytesIO
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, Body, Depends
+from fastapi import FastAPI, Body, HTTPException
 from evidently.ui.workspace import RemoteWorkspace
 
 from opentelemetry import trace
@@ -15,16 +15,19 @@ from opentelemetry.trace import get_tracer_provider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.jaeger.thrift import JaegerExporter
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry import metrics
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.sdk.metrics import MeterProvider
+from prometheus_client import start_http_server
+from opentelemetry.metrics import set_meter_provider
 
-from client.api.metrics_handler import MetricsHandler, otel_metric
 from client.api.schema import RawItem
 from client.api.utils import (
     map_evidently_data,
     custom_evidently_report,
     ApiConfig,
-    Predictor,
+    load_artifacts
 )
-
 os.getenv("JAEGER_AGENT_HOST")
 
 trace.set_tracer_provider(
@@ -41,95 +44,58 @@ jaeger_exporter = JaegerExporter(
 span_processor = BatchSpanProcessor(jaeger_exporter)
 get_tracer_provider().add_span_processor(span_processor)
 
-# ----------------------------------------------------------------------
-""" 
-The main class for to creating the prediction service, which initializes the predictor and handles prediction requests.
-This will create a new instance of `Predictor` with provided configuration from `ApiConfig`
-"""
+resource = Resource.create(attributes={SERVICE_NAME: "prediction-service"})
+start_http_server(port=8001, addr="0.0.0.0")
 
+reader = PrometheusMetricReader()
+provider = MeterProvider(resource=resource, metric_readers=[reader])
 
-# ----------------------------------------------------------------------
-class PredictionService:
-    def __init__(self, cfg: ApiConfig, predictor: Predictor):
-        self.cfg = cfg
-        self.predictor = predictor
-        self.metrics = MetricsHandler()
+set_meter_provider(provider)
+meter = metrics.get_meter("prediction_spread", "0.1.1")
 
-    @classmethod
-    def create(cls, cfg: ApiConfig):
-        predictor = Predictor(cfg)
-        predictor.load_artifacts()
-        return cls(cfg, predictor)
+prediction_counter = meter.create_counter(
+    "api_prediction_count",
+    description="Count of predictions made by the API",
+)
 
-    # --------------------------------------------------------------
-    # helper build response
-    # --------------------------------------------------------------
-    def _build_response(
-        self,
-        start_time: float,
-        preds: np.ndarray,
-        proba: np.ndarray,
-        entropies: List[float],
-        confidences: List[float],
-    ):
-        return {
-            "inference_time_ms": round((time() - start_time) * 1000, 2),
-            "predictions": [
-                {
-                    "result": "Accept" if y == 0 else "Decline",
-                    "prob_accept": float(p[0]),
-                    "prob_decline": float(p[1]),
-                    "entropy": round(e, 4),
-                    "confidence": round(c, 4),
-                }
-                for y, p, e, c in zip(preds, proba, entropies, confidences)
-            ],
-            "metrics": {
-                "avg_entropy": self.metrics.avg_entropy,
-                "avg_confidence": self.metrics.avg_confidence,
-            },
-        }
+prediction_latency = meter.create_histogram(
+    "api_prediction_latency",
+    description="Latency of predictions made by the API",
+    unit="ms",
+)
 
-    @otel_metric
-    def predict_items(self, items: List[RawItem]):
-        with tracer.start_as_current_span("predict_items"):
-            df = pd.DataFrame([i.dict() for i in items]).replace({None: np.nan})
-            return self.predictor.inference(df)
+error_counter = meter.create_counter(
+    "api_prediction_error_count",
+    description="Number of failed prediction requests",
+)
 
-    @otel_metric
-    def predict_by_id(self, sk_id: int):
-        with tracer.start_as_current_span("predict_by_id") as span:
-            with tracer.start_as_current_span(
-                "data-loader", links=[trace.Link(span.get_span_context())]
-            ):
-                minio_client = self.cfg.get_minio_client()
-                response = minio_client.get_object(
-                    "sample-data", "data/application_test.csv"
-                )
-                df_all = pd.read_csv(BytesIO(response.read()))
+batch_size_hist = meter.create_histogram(
+    "api_prediction_batch_size",
+    description="Batch size of prediction requests",
+)
 
-                row = df_all[df_all["SK_ID_CURR"] == sk_id]
-                if row.empty:
-                    return {"error": f"ID {sk_id} not found"}
-            return self.predictor.inference(row)
+def otel_metric(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        start_time = time()
+        try:
+            response = fn(*args, **kwargs)
+        except Exception:
+            error_counter.add(1)
+            raise
+        latency_ms = (time() - start_time) * 1000
 
+        batch_size = len(response["predictions"])
+        prediction_counter.add(batch_size)
+        prediction_latency.record(latency_ms)
+        batch_size_hist.record(batch_size)
+        return response
 
-# ----------------------------------------------------------------------
-"""
-The main FastAPI app which initializes the PredictionService and defines the API endpoints.
-
-"""
+    return wrapper
 
 
 # ----------------------------------------------------------------------
 cfg = ApiConfig()
-prediction_service = PredictionService.create(cfg)
-
-
-def get_service() -> PredictionService:
-    return prediction_service
-
-
 app = FastAPI()
 
 
@@ -139,25 +105,76 @@ def health():
 
 
 @app.post("/prediction")
-def predict(
-    items: List[RawItem] = Body(...),
-    service: PredictionService = Depends(get_service),
-):
-    return service.predict_items(items)
+@otel_metric
+def predict(items: List[RawItem] = Body(...)):
+    with tracer.start_as_current_span("predict_items"):
+        start_ts = time()
+
+        binning, selector, model = load_artifacts(cfg)
+
+        df = pd.DataFrame([i.model_dump() for i in items]).replace({None: np.nan})
+        df = df[[c for c in df.columns if c in binning.variable_names]]
+
+        X = selector.transform(binning.transform(df))
+        proba = model.predict_proba(X)
+        preds = proba.argmax(axis=1)
+
+        return {
+            "prediction_method": "batch",
+            "inference_time_ms": round((time() - start_ts) * 1000, 2),
+            "predictions": [
+                {
+                    "result": "Accept" if y == 0 else "Decline",
+                    "prob_accept": float(p[0]),
+                    "prob_decline": float(p[1]),
+                }
+                for y, p in zip(preds, proba,)
+            ],
+        }
 
 
 @app.post("/prediction-by-id")
-def predict_by_id(id: int, service: PredictionService = Depends(get_service)):
-    return service.predict_by_id(id)
+@otel_metric
+def predict_by_id(id: int):
+    with tracer.start_as_current_span("predict_items"):
+        start_ts = time()
+
+        binning, selector, model = load_artifacts(cfg)
+
+        minio_client = cfg.get_minio_client()
+        response = minio_client.get_object(
+                    "sample-data", "data/application_test.csv"
+                )
+        feature_df = pd.read_csv(BytesIO(response.read()))
+        row = feature_df[feature_df["SK_ID_CURR"] == id]
+        
+        if row.empty:
+            raise HTTPException(status_code=404, detail="ID not found")
+
+        X = selector.transform(binning.transform(row))
+        proba = model.predict_proba(X)
+        preds = proba.argmax(axis=1)
+        
+
+        return {
+            "prediction_method": "single",
+            "inference_time_ms": round((time() - start_ts) * 1000, 2),
+            "predictions": [
+                {
+                    "result": "Accept" if preds[0] == 0 else "Decline",
+                    "prob_accept": float(proba[0][0]),
+                    "prob_decline": float(proba[0][1]),
+                }
+            ],
+        }
 
 
 @app.get("/data-monitor")
-def data_monitor(service: PredictionService = Depends(get_service)):
+def data_monitor():
     with tracer.start_as_current_span("data_monitor") as span:
         with tracer.start_as_current_span(
             "data-drift-loader", links=[trace.Link(span.get_span_context())]
         ):
-            cfg = service.cfg
             workspace_path = cfg.evidently_workspace
             evidently_ws = RemoteWorkspace(workspace_path)
 
@@ -180,8 +197,7 @@ def data_monitor(service: PredictionService = Depends(get_service)):
             evidently_ws.add_run(project.id, snapshot)
 
         return {
-                "status": "stored",
-                "project_id": project.id,
-                "project_name": project_name,
-            }
-
+            "status": "stored",
+            "project_id": project.id,
+            "project_name": project_name,
+        }
