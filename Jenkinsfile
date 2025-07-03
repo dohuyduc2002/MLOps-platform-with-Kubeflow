@@ -37,7 +37,6 @@ pipeline {
         MLFLOW_TRACKING_URI   = 'http://mlflow.ducdh.com'
         MINIO_BUCKET_NAME     = 'sample-data'
         KFP_API_URL           = 'http://kubeflow.ducdh.com/pipeline'
-        EVIDENTLY_WORKSPACE   = 'http://${params['EVIDENTLY_IP']}:8000'
 
         RUN_ID = ''
     }
@@ -57,7 +56,7 @@ pipeline {
             }
         }
 
-        stage('Schedule KFP recurring run') {
+        stage('Deploy recurring training/data pipeline on Kubeflow') {
             agent { docker { image 'microwave1005/kfp-jenkins-ci:0.1' } }
             steps {
                 withCredentials([
@@ -215,7 +214,7 @@ pipeline {
                                 --namespace api \
                                 --set monitoring.enabled=true \
                                 --set replicaCount=1 \
-                                --set env.EVIDENTLY_WORKSPACE=${EVIDENTLY_WORKSPACE} \
+                                --set env.EVIDENTLY_WORKSPACE="http://${params['EVIDENTLY_IP']}:8000" \
                                 --set env.PARENT_RUN_ID=${RUN_ID} \
                                 --set version=${TAG} \
                                 --set image.tag=${TAG} \
@@ -225,7 +224,7 @@ pipeline {
                                 --set ingress.rules[0].paths[0].path="/" \
                                 --set ingress.rules[0].paths[0].pathType=Prefix \
                                 --set ingress.rules[0].paths[0].serviceName=prediction-api \
-                                --set ingress.rules[0].paths[0].servicePort=8000 \
+                                --set ingress.rules[0].paths[0].servicePort=8000 
                         '''
                     }
                 }
