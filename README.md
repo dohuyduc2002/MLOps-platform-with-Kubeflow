@@ -1,7 +1,7 @@
 # 🛠 End to End Credit Scoring System on Customized Kubeflow Platform
 An platform for Data Science team to build and serve ML model using multi cloud environment (GCP and Azure) with CI/CD pipeline, monitoring. This project leverages Kubeflow, MLflow, Minio, Prometheus, Grafana, Evidently and FastAPI to build a complete a ML system. 
 
-![Diagram](media/arch.svg)
+![Diagram](media/arch1.svg)
 
 **Disclaimer**: This is a version 1.2 of this project, I will keep updating this project to make it more complete and useful.
 
@@ -257,8 +257,9 @@ docker push microwave1005/scipy-img:latest
 #### Ingress controller
 I'm using Nginx ingress controller to expose all services in this project to the internet which you can access services by domain name. In this case, I'm setting `proxy-body-size` to `5120G` to allow large file upload to Minio. I'm also set proxy timeout to `600` seconds to allow long running request in `GET` method in Evidently in the `api` for monitoring data drift.
 ```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
 
-helm install ingress-nginx ./helm-charts/ingress-nginx-chart \
+helm install ingress-nginx ingress-nginx/ingress-nginx \
   --namespace ingress-nginx \
   --create-namespace \
   --set controller.service.type=LoadBalancer \
@@ -341,7 +342,9 @@ k apply -f helm-charts/mlflow//postgres/postgres.yaml
 
 Then install Mlflow using helm chart
 ```bash
-helm install mlflow ./helm-charts/mlflow \
+helm repo add community-charts https://community-charts.github.io/helm-charts
+
+helm install mlflow community-charts/mlflow \
   --namespace mlflow \
   --set ingress.enabled=false \
   -f helm-charts/mlflow/custom-values.yaml
@@ -350,7 +353,7 @@ helm install mlflow ./helm-charts/mlflow \
 I'm using Postgres as backend store and Minio as artifact store. This can be configure using this cmd
 
 ```bash
-helm upgrade --install mlflow ./helm-charts/mlflow \ \
+helm upgrade --install mlflow community-charts/mlflow \
   --namespace mlflow \
   --reuse-values \
   \
@@ -387,7 +390,9 @@ helm upgrade --install mlflow ./helm-charts/mlflow \ \
 To monitor the system, I'm using Prometheus and Grafana. I'm using Kube-prometheus-stack helm chart to deploy Prometheus and Grafana in this project. You can find the helm chart in `monitor` folder which is cloned from this repo [Kube-prometheus-stack helm chart](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack)
 
 ```bash
-helm install kps ./helm-charts/monitoring/kube-prometheus-stack -n monitoring --create-namespace
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+
+helm install kps prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
 ```
 
 #### Prometheus
@@ -406,7 +411,7 @@ You can also check other Grafana dashboards in [Grafana lab](https://grafana.com
 ![Grafana Node Exporter Full dashboard](media/graf_node.png)
 
 ```bash
-helm upgrade kps ./helm-charts/monitoring/kube-prometheus-stack \
+helm upgrade kps prometheus-community/kube-prometheus-stack \
   -n monitoring \
   -f helm-charts/monitoring/custom-values.yaml \
   --set slack.channel="#kfp" \
@@ -428,10 +433,11 @@ helm install evidently ./helm-charts/evidently \
 To trace the request and response in the API endpoint, I'm using Jaeger `all-in-one` deploymen in Jaeger helm chart to deploy Jaeger in this project. You can find the helm chart in `jaeger` folder which is cloned from this repo [Jaeger all-in-one helm chart](https://github.com/jaegertracing/helm-charts/tree/main/charts/jaeger). In my app, I'm manually trace all my POST and GET method.
 
 ```bash
-helm install jaeger ./helm-charts/jaeger \
+helm repo add jaegertracing https://jaegertracing.github.io/helm-charts
+
+helm install jaeger jaegertracing/jaeger \
   --namespace monitoring \
   --values helm-charts/jaeger/custom-values.yaml
-
 ```
 
 ![Jaeger](media/jaeger.png)
@@ -485,13 +491,13 @@ kfp component build \
   --build-image \
   --platform linux/amd64 \
   --push-image \
-  src/pipeline/scripts/ 
+  src/model_pipeline/scripts/ 
 ```
 Next, compile the pipeline into yaml file
 ```bash
 kfp dsl compile \
-  --py src/pipeline/pipeline.py \
-  --output src/pipeline/pipeline.yaml
+  --py src/model_pipeline/pipeline.py \
+  --output src/model_pipeline/pipeline.yaml
 ```
 Then, navigate to [Jenkins](#jenkins) to run the Kubeflow pipeline in CICD. 
 ### Katib
